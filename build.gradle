@@ -1,0 +1,43 @@
+plugins {
+    id 'java'
+}
+
+group = 'com.shop'
+version = '0.0.1-SNAPSHOT'
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation platform('io.cucumber:cucumber-bom:7.20.1')
+    testImplementation platform('org.junit:junit-bom:5.11.3')
+
+    testImplementation 'io.cucumber:cucumber-java'
+    testImplementation 'io.cucumber:cucumber-junit-platform-engine'
+    testImplementation 'io.cucumber:cucumber-picocontainer'
+    testImplementation 'org.junit.platform:junit-platform-suite'
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+
+    testImplementation 'org.assertj:assertj-core:3.27.0'
+    testImplementation 'org.awaitility:awaitility:4.2.2'
+    testImplementation 'com.fasterxml.jackson.core:jackson-databind:2.18.2'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        showStandardStreams = true
+    }
+    // Tag filter, e.g. -Dcucumber.filter.tags="not @payment-decline"
+    if (System.getProperty('cucumber.filter.tags')) {
+        systemProperty 'cucumber.filter.tags', System.getProperty('cucumber.filter.tags')
+    }
+}
