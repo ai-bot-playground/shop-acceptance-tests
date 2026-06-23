@@ -18,8 +18,11 @@ Feature: End-to-end purchase on preprod
     Then the order eventually becomes "REJECTED"
     And the available stock of the product is 1
 
+  # The payment mock deterministically declines when the order AMOUNT ends in
+  # .66 (cents % 100 == 66). Ordering 1 unit of a 6.66 product makes the amount
+  # exactly 6.66, so the decline fires regardless of the random failure rate.
   Scenario: Payment declined - order cancelled and reserved stock released
     Given a test product priced 6.66 with 5 units in stock
-    When a buyer orders 2 units of the product
+    When a buyer orders 1 unit of the product
     Then the order eventually becomes "CANCELLED"
     And the available stock of the product is 5
