@@ -5,8 +5,9 @@ name: preprod-gate
 # as the local kind-preprod cluster + podman), deploys the PR candidate of the
 # calling service onto preprod and runs the cross-service acceptance suite.
 #
-# Why self-hosted: the gate needs podman (build), kind (load) and the kubeconfig
-# context kind-preprod (deploy + port-forward) — all local to your machine.
+# Steps use PowerShell: on a Windows self-hosted runner `shell: bash` resolves to
+# C:\Windows\System32\bash.exe (the WSL launcher), where podman/kubectl/helm and
+# the Windows kubeconfig are not available.
 on:
   workflow_call:
     inputs:
@@ -23,14 +24,15 @@ concurrency:
 jobs:
   gate:
     runs-on: [self-hosted, shop-preprod]
+    defaults:
+      run:
+        shell: powershell
     env:
       KIND_EXPERIMENTAL_PROVIDER: podman
       CTX: kind-preprod
       NS: shop
       SVC: ${{ inputs.service }}
       TAG: pr-${{ github.event.pull_request.number }}
-      INFRA_REF: develop_v_0.0.1
-      ACCEPTANCE_REF: develop_v_0.0.1
     steps:
       # The calling service's PR (merge result) — default checkout = caller repo.
       - name: Checkout candidate service
@@ -42,70 +44,74 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ai-bot-playground/shop-infra
-          ref: ${{ env.INFRA_REF }}
+          ref: develop_v_0.0.1
           path: infra
 
       - name: Checkout acceptance suite (shop-acceptance-tests)
         uses: actions/checkout@v4
         with:
           repository: ai-bot-playground/shop-acceptance-tests
-          ref: ${{ env.ACCEPTANCE_REF }}
+          ref: develop_v_0.0.1
           path: acceptance
 
       - name: Build candidate image
-        shell: bash
         run: |
-          {
-            echo "PATH=$PATH"
-            echo "USERPROFILE=$USERPROFILE  HOME=$HOME  APPDATA=$APPDATA"
-            echo "which podman: $(which podman 2>&1)"
-            echo "--- podman version ---"; podman version 2>&1 || true
-            echo "--- podman machine list ---"; podman machine list 2>&1 || true
-          } > "$GITHUB_WORKSPACE/diag.log" 2>&1
-          podman build -t "localhost/${SVC}:${TAG}" candidate > "$GITHUB_WORKSPACE/build.log" 2>&1
+          $img = "localhost/$($env:SVC):$($env:TAG)"
+          podman build -t $img candidate
+          if ($LASTEXITCODE -ne 0) { throw "podman build failed" }
 
       - name: Load candidate image into kind-preprod
-        shell: bash
         run: |
-          podman save -o image.tar "localhost/${SVC}:${TAG}"
+          $img = "localhost/$($env:SVC):$($env:TAG)"
+          podman save -o image.tar $img
+          if ($LASTEXITCODE -ne 0) { throw "podman save failed" }
           kind load image-archive image.tar --name preprod
+          if ($LASTEXITCODE -ne 0) { throw "kind load failed" }
 
       - name: Ensure baseline stack is deployed (idempotent)
-        shell: bash
         run: |
-          helm upgrade --install shop infra/helm --kube-context "$CTX" -n "$NS" --create-namespace \
-            -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --timeout 6m
+          helm upgrade --install shop infra/helm --kube-context $env:CTX -n $env:NS --create-namespace -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --timeout 6m
+          if ($LASTEXITCODE -ne 0) { throw "helm upgrade failed" }
 
       - name: Deploy candidate onto preprod
-        shell: bash
         run: |
-          kubectl --context "$CTX" -n "$NS" set image "deployment/${SVC}" "${SVC}=localhost/${SVC}:${TAG}"
-          kubectl --context "$CTX" -n "$NS" rollout status "deployment/${SVC}" --timeout=180s
+          $img = "localhost/$($env:SVC):$($env:TAG)"
+          kubectl --context $env:CTX -n $env:NS set image "deployment/$($env:SVC)" "$($env:SVC)=$img"
+          if ($LASTEXITCODE -ne 0) { throw "set image failed" }
+          kubectl --context $env:CTX -n $env:NS rollout status "deployment/$($env:SVC)" --timeout=180s
+          if ($LASTEXITCODE -ne 0) { throw "rollout failed" }
 
       - name: Run acceptance suite against preprod
-        shell: bash
         run: |
-          kubectl --context "$CTX" -n "$NS" port-forward svc/shop-gateway 8080:8080 &
-          PF=$!
-          trap 'kill $PF 2>/dev/null || true' EXIT
-          echo "waiting for gateway health ..."
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:8080/actuator/health >/dev/null && break || sleep 2
-          done
-          cd acceptance
-          SHOP_GATEWAY_URL=http://localhost:8080 ./gradlew test --no-daemon --console=plain
+          $ctx = $env:CTX; $ns = $env:NS
+          $pf = Start-Job { kubectl --context $using:ctx -n $using:ns port-forward svc/shop-gateway 8080:8080 }
+          try {
+            $ok = $false
+            foreach ($i in 1..30) {
+              Start-Sleep -Seconds 2
+              try { if ((Invoke-WebRequest "http://localhost:8080/actuator/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { $ok = $true; break } } catch {}
+            }
+            if (-not $ok) { throw "gateway not reachable on localhost:8080" }
+            $env:SHOP_GATEWAY_URL = "http://localhost:8080"
+            Set-Location acceptance
+            .\gradlew.bat test --no-daemon --console=plain
+            if ($LASTEXITCODE -ne 0) { throw "acceptance suite failed" }
+          } finally {
+            Stop-Job $pf -ErrorAction SilentlyContinue
+            Remove-Job $pf -ErrorAction SilentlyContinue
+          }
 
       - name: Publish acceptance report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: acceptance-report-${{ env.SVC }}-${{ env.TAG }}
+          name: acceptance-report-${{ inputs.service }}-pr-${{ github.event.pull_request.number }}
           path: acceptance/build/reports/tests/test
           if-no-files-found: ignore
 
       - name: Cleanup candidate artifacts
         if: always()
-        shell: bash
         run: |
-          rm -f image.tar || true
-          podman rmi "localhost/${SVC}:${TAG}" 2>/dev/null || true
+          Remove-Item -Force image.tar -ErrorAction SilentlyContinue
+          podman rmi "localhost/$($env:SVC):$($env:TAG)" 2>$null
+          exit 0
