@@ -55,13 +55,14 @@ jobs:
       - name: Build candidate image
         shell: bash
         run: |
-          echo "PATH=$PATH"
-          echo "USERPROFILE=$USERPROFILE  HOME=$HOME  APPDATA=$APPDATA"
-          which podman || echo "NO podman on PATH"
-          podman version || echo "podman version failed"
-          podman machine list || echo "podman machine list failed"
-          set -o pipefail
-          podman build -t "localhost/${SVC}:${TAG}" candidate 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          {
+            echo "PATH=$PATH"
+            echo "USERPROFILE=$USERPROFILE  HOME=$HOME  APPDATA=$APPDATA"
+            echo "which podman: $(which podman 2>&1)"
+            echo "--- podman version ---"; podman version 2>&1 || true
+            echo "--- podman machine list ---"; podman machine list 2>&1 || true
+          } > "$GITHUB_WORKSPACE/diag.log" 2>&1
+          podman build -t "localhost/${SVC}:${TAG}" candidate > "$GITHUB_WORKSPACE/build.log" 2>&1
 
       - name: Load candidate image into kind-preprod
         shell: bash
