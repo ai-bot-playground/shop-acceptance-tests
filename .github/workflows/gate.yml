@@ -77,16 +77,15 @@ jobs:
           kind load image-archive image.tar --name preprod
           if ($LASTEXITCODE -ne 0) { throw "kind load failed" }
 
-      - name: Ensure baseline stack is deployed (idempotent)
-        run: |
-          helm upgrade --install shop infra/helm --kube-context $env:CTX -n $env:NS --create-namespace -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --timeout 6m
-          if ($LASTEXITCODE -ne 0) { throw "helm upgrade failed" }
-
+      # One helm operation owns everything (Helm 4 uses server-side apply): it
+      # deploys the baseline stack AND the candidate image via --set-string, so
+      # no `kubectl set image` is needed. --force-conflicts reclaims any fields a
+      # previous run's kubectl may have grabbed, avoiding SSA ownership conflicts.
       - name: Deploy candidate onto preprod
         run: |
           $img = "localhost/$($env:SVC):$($env:TAG)"
-          kubectl --context $env:CTX -n $env:NS set image "deployment/$($env:SVC)" "$($env:SVC)=$img"
-          if ($LASTEXITCODE -ne 0) { throw "set image failed" }
+          helm upgrade --install shop infra/helm --kube-context $env:CTX -n $env:NS --create-namespace -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --set-string "services.$($env:SVC).image=$img" --force-conflicts --timeout 6m
+          if ($LASTEXITCODE -ne 0) { throw "helm upgrade failed" }
           kubectl --context $env:CTX -n $env:NS rollout status "deployment/$($env:SVC)" --timeout=180s
           if ($LASTEXITCODE -ne 0) { throw "rollout failed" }
 
