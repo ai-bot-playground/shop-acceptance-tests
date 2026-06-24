@@ -1,0 +1,103 @@
+name: preprod-gate
+
+# Reusable, full preprod quality gate. Each application service calls this from
+# its own "PR to main" workflow. It runs on the SELF-HOSTED runner (same machine
+# as the local kind-preprod cluster + podman), deploys the PR candidate of the
+# calling service onto preprod and runs the cross-service acceptance suite.
+#
+# Why self-hosted: the gate needs podman (build), kind (load) and the kubeconfig
+# context kind-preprod (deploy + port-forward) — all local to your machine.
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service repo/name being gated (e.g. shop-order)
+        required: true
+        type: string
+
+# Serialize: the preprod cluster is shared, so only one gate touches it at a time.
+concurrency:
+  group: preprod-gate
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    runs-on: [self-hosted, shop-preprod]
+    env:
+      KIND_EXPERIMENTAL_PROVIDER: podman
+      CTX: kind-preprod
+      NS: shop
+      SVC: ${{ inputs.service }}
+      TAG: pr-${{ github.event.pull_request.number }}
+      INFRA_REF: develop_v_0.0.1
+      ACCEPTANCE_REF: develop_v_0.0.1
+    steps:
+      # The calling service's PR (merge result) — default checkout = caller repo.
+      - name: Checkout candidate service
+        uses: actions/checkout@v4
+        with:
+          path: candidate
+
+      - name: Checkout Helm chart (shop-infra)
+        uses: actions/checkout@v4
+        with:
+          repository: ai-bot-playground/shop-infra
+          ref: ${{ env.INFRA_REF }}
+          path: infra
+
+      - name: Checkout acceptance suite (shop-acceptance-tests)
+        uses: actions/checkout@v4
+        with:
+          repository: ai-bot-playground/shop-acceptance-tests
+          ref: ${{ env.ACCEPTANCE_REF }}
+          path: acceptance
+
+      - name: Build candidate image
+        shell: bash
+        run: podman build -t "localhost/${SVC}:${TAG}" candidate
+
+      - name: Load candidate image into kind-preprod
+        shell: bash
+        run: |
+          podman save -o image.tar "localhost/${SVC}:${TAG}"
+          kind load image-archive image.tar --name preprod
+
+      - name: Ensure baseline stack is deployed (idempotent)
+        shell: bash
+        run: |
+          helm upgrade --install shop infra/helm --kube-context "$CTX" -n "$NS" --create-namespace \
+            -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --timeout 6m
+
+      - name: Deploy candidate onto preprod
+        shell: bash
+        run: |
+          kubectl --context "$CTX" -n "$NS" set image "deployment/${SVC}" "${SVC}=localhost/${SVC}:${TAG}"
+          kubectl --context "$CTX" -n "$NS" rollout status "deployment/${SVC}" --timeout=180s
+
+      - name: Run acceptance suite against preprod
+        shell: bash
+        run: |
+          kubectl --context "$CTX" -n "$NS" port-forward svc/shop-gateway 8080:8080 &
+          PF=$!
+          trap 'kill $PF 2>/dev/null || true' EXIT
+          echo "waiting for gateway health ..."
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8080/actuator/health >/dev/null && break || sleep 2
+          done
+          cd acceptance
+          SHOP_GATEWAY_URL=http://localhost:8080 ./gradlew test --no-daemon --console=plain
+
+      - name: Publish acceptance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-report-${{ env.SVC }}-${{ env.TAG }}
+          path: acceptance/build/reports/tests/test
+          if-no-files-found: ignore
+
+      - name: Cleanup candidate artifacts
+        if: always()
+        shell: bash
+        run: |
+          rm -f image.tar || true
+          podman rmi "localhost/${SVC}:${TAG}" 2>/dev/null || true
