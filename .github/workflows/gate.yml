@@ -29,6 +29,7 @@ jobs:
         shell: powershell
     env:
       KIND_EXPERIMENTAL_PROVIDER: podman
+      TESTCONTAINERS_RYUK_DISABLED: "true"
       CTX: kind-preprod
       NS: shop
       SVC: ${{ inputs.service }}
@@ -53,6 +54,14 @@ jobs:
           repository: ai-bot-playground/shop-acceptance-tests
           ref: develop_v_0.0.1
           path: acceptance
+
+      # Component stage first: the service's own Cucumber + Testcontainers suite.
+      # Fails the gate before any image build / deploy if the service is broken.
+      - name: Component tests (Cucumber + Testcontainers)
+        run: |
+          Set-Location candidate
+          .\gradlew.bat test --no-daemon --console=plain
+          if ($LASTEXITCODE -ne 0) { throw "component tests failed" }
 
       - name: Build candidate image
         run: |
