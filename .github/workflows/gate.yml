@@ -52,14 +52,14 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ai-bot-playground/shop-infra
-          ref: develop_v_0.0.1
+          ref: main
           path: infra
 
       - name: Checkout acceptance suite (shop-acceptance-tests)
         uses: actions/checkout@v4
         with:
           repository: ai-bot-playground/shop-acceptance-tests
-          ref: develop_v_0.0.1
+          ref: main
           path: acceptance
 
       # Component stage first: the service's own Cucumber + Testcontainers suite.
