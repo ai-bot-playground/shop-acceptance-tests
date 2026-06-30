@@ -17,6 +17,10 @@ import java.util.UUID;
  *
  * The create/set/delete calls use non-prod test-support endpoints so each test
  * can provision and tear down its own isolated data.
+ *
+ * Supports mock login: a randomly generated (or explicitly set) userId is
+ * stored as the current user and sent as the {@code X-User-Id} header on every
+ * request so that shop-catalog can apply user-specific margins.
  */
 public class ShopClient {
 
@@ -27,11 +31,41 @@ public class ShopClient {
             .connectTimeout(Duration.ofSeconds(5))
             .build();
 
+    private String currentUserId;
+
     public ShopClient() {
         String url = System.getenv("SHOP_GATEWAY_URL");
         this.baseUrl = (url == null || url.isBlank())
                 ? "http://localhost:8080"
                 : url.replaceAll("/+$", "");
+    }
+
+    // ---- mock login / user context ----
+
+    /**
+     * Generates a random mock userId, stores it as the current user, and
+     * returns it. Subsequent requests will carry the {@code X-User-Id} header.
+     */
+    public String login() {
+        this.currentUserId = UUID.randomUUID().toString();
+        return this.currentUserId;
+    }
+
+    /**
+     * Sets an explicit userId as the current user (useful for deterministic
+     * margin verification in scenarios).
+     */
+    public void loginAs(String userId) {
+        this.currentUserId = userId;
+    }
+
+    /** Clears the current user context; no {@code X-User-Id} header is sent. */
+    public void logout() {
+        this.currentUserId = null;
+    }
+
+    public String currentUserId() {
+        return currentUserId;
     }
 
     // ---- test-data provisioning (non-prod) ----
@@ -46,18 +80,18 @@ public class ShopClient {
 
     /** PUT /api/inventory/{productId} {stock} */
     public void setStock(String productId, int units) {
-        send(HttpRequest.newBuilder(URI.create(baseUrl + "/api/inventory/" + productId))
+        send(request(URI.create(baseUrl + "/api/inventory/" + productId))
                 .header("Content-Type", "application/json")
                 .PUT(HttpRequest.BodyPublishers.ofString("{\"stock\":" + units + "}"))
                 .build());
     }
 
     public void deleteProduct(String productId) {
-        sendQuietly(HttpRequest.newBuilder(URI.create(baseUrl + "/api/products/" + productId)).DELETE().build());
+        sendQuietly(request(URI.create(baseUrl + "/api/products/" + productId)).DELETE().build());
     }
 
     public void deleteStock(String productId) {
-        sendQuietly(HttpRequest.newBuilder(URI.create(baseUrl + "/api/inventory/" + productId)).DELETE().build());
+        sendQuietly(request(URI.create(baseUrl + "/api/inventory/" + productId)).DELETE().build());
     }
 
     // ---- purchase flow ----
@@ -67,10 +101,19 @@ public class ShopClient {
         return send(get("/api/inventory/" + productId)).path("available").asInt();
     }
 
+    /**
+     * GET /api/products/{productId} -> { ..., "price": <double> }
+     * Returns the price as seen by the current user (margin applied by
+     * shop-catalog when {@code X-User-Id} is set).
+     */
+    public double productPrice(String productId) {
+        return send(get("/api/products/" + productId)).path("price").asDouble();
+    }
+
     /** POST /api/orders (Idempotency-Key) -> 202 { "orderId": "<id>" } */
     public String createOrder(String productId, long quantity) {
         String payload = "{\"productId\":\"" + productId + "\",\"quantity\":" + quantity + "}";
-        HttpRequest req = HttpRequest.newBuilder(URI.create(baseUrl + "/api/orders"))
+        HttpRequest req = request(URI.create(baseUrl + "/api/orders"))
                 .header("Content-Type", "application/json")
                 .header("Idempotency-Key", UUID.randomUUID().toString())
                 .POST(HttpRequest.BodyPublishers.ofString(payload))
@@ -89,12 +132,24 @@ public class ShopClient {
 
     // ---- helpers ----
 
+    /**
+     * Base request builder that automatically attaches the {@code X-User-Id}
+     * header when a user is logged in.
+     */
+    private HttpRequest.Builder request(URI uri) {
+        HttpRequest.Builder builder = HttpRequest.newBuilder(uri);
+        if (currentUserId != null && !currentUserId.isBlank()) {
+            builder.header("X-User-Id", currentUserId);
+        }
+        return builder;
+    }
+
     private HttpRequest get(String path) {
-        return HttpRequest.newBuilder(URI.create(baseUrl + path)).GET().build();
+        return request(URI.create(baseUrl + path)).GET().build();
     }
 
     private HttpRequest post(String path, String json) {
-        return HttpRequest.newBuilder(URI.create(baseUrl + path))
+        return request(URI.create(baseUrl + path))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(json))
                 .build();
