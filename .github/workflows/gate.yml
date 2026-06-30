@@ -1,0 +1,151 @@
+name: preprod-gate
+
+# Reusable, full preprod quality gate. Each application service calls this from
+# its own "PR preprod gate" workflow. It runs on the CALLING repo's OWN
+# self-hosted runner (runner label = the service name, e.g. shop-order; every
+# repo has its own runner, all on the same machine as the local kind-preprod
+# cluster + podman), deploys the PR candidate of the calling service onto preprod
+# and runs the cross-service acceptance suite.
+#
+# Steps use PowerShell: on a Windows self-hosted runner `shell: bash` resolves to
+# C:\Windows\System32\bash.exe (the WSL launcher), where podman/kubectl/helm and
+# the Windows kubeconfig are not available.
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service repo/name being gated (e.g. shop-order)
+        required: true
+        type: string
+
+# Intra-repo serialization only: GitHub `concurrency` groups are scoped PER
+# REPOSITORY, so this keeps two runs of the SAME repo's gate from overlapping but
+# does NOT coordinate across repos. Cross-repo serialization (each service now has
+# its own runner) is enforced by a machine-local mutex in the deploy step below.
+concurrency:
+  group: preprod-gate
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    # Route to the calling repo's OWN runner: each service repo registers a
+    # self-hosted runner labelled with its repo name (= inputs.service).
+    runs-on: [self-hosted, "${{ inputs.service }}"]
+    defaults:
+      run:
+        shell: powershell
+    env:
+      KIND_EXPERIMENTAL_PROVIDER: podman
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+      CTX: kind-preprod
+      NS: shop
+      SVC: ${{ inputs.service }}
+      TAG: pr-${{ github.event.pull_request.number }}
+    steps:
+      # The calling service's PR (merge result) — default checkout = caller repo.
+      - name: Checkout candidate service
+        uses: actions/checkout@v4
+        with:
+          path: candidate
+
+      - name: Checkout Helm chart (shop-infra)
+        uses: actions/checkout@v4
+        with:
+          repository: ai-bot-playground/shop-infra
+          ref: develop_v_0.0.1
+          path: infra
+
+      - name: Checkout acceptance suite (shop-acceptance-tests)
+        uses: actions/checkout@v4
+        with:
+          repository: ai-bot-playground/shop-acceptance-tests
+          ref: develop_v_0.0.1
+          path: acceptance
+
+      # Component stage first: the service's own Cucumber + Testcontainers suite.
+      # Fails the gate before any image build / deploy if the service is broken.
+      - name: Component tests (Cucumber + Testcontainers)
+        run: |
+          Set-Location candidate
+          .\gradlew.bat test --no-daemon --console=plain
+          if ($LASTEXITCODE -ne 0) { throw "component tests failed" }
+
+      - name: Build candidate image
+        run: |
+          $img = "localhost/$($env:SVC):$($env:TAG)"
+          podman build -t $img candidate
+          if ($LASTEXITCODE -ne 0) { throw "podman build failed" }
+
+      # Cluster-touching section, guarded by a MACHINE-LOCAL mutex. Every service
+      # repo has its own runner, but they all share ONE kind-preprod cluster + one
+      # helm release `shop`, and GitHub `concurrency` does not serialize across
+      # repos. Since all runners live on the same machine, a Global\ named mutex
+      # lets only ONE gate at a time run load -> helm upgrade -> rollout ->
+      # acceptance; the others block here until it is released. The mutex
+      # auto-releases if a holding run crashes (AbandonedMutexException => the next
+      # waiter takes ownership and continues). Component tests + image build above
+      # stay OUTSIDE the lock, so they still run in parallel across repos.
+      - name: Deploy candidate & run acceptance (preprod, mutex-guarded)
+        run: |
+          $mutex = New-Object System.Threading.Mutex($false, "Global\shop-preprod-gate")
+          $haveLock = $false
+          try {
+            Write-Host "Waiting for the shared preprod-gate lock..."
+            try { $haveLock = $mutex.WaitOne([TimeSpan]::FromMinutes(60)) } catch [System.Threading.AbandonedMutexException] { $haveLock = $true }
+            if (-not $haveLock) { throw "timed out (60 min) waiting for the preprod-gate lock - another repo's gate is holding the shared kind-preprod cluster" }
+            Write-Host "Acquired preprod-gate lock; this gate now owns the shared cluster."
+
+            $img = "localhost/$($env:SVC):$($env:TAG)"
+
+            # Load the candidate image into the kind node.
+            podman save -o image.tar $img
+            if ($LASTEXITCODE -ne 0) { throw "podman save failed" }
+            kind load image-archive image.tar --name preprod
+            if ($LASTEXITCODE -ne 0) { throw "kind load failed" }
+
+            # One helm operation owns everything (Helm 4 server-side apply): deploys
+            # the baseline stack AND the candidate image via --set-string, so no
+            # `kubectl set image` is needed. --force-conflicts reclaims any fields a
+            # previous run's kubectl grabbed, avoiding SSA ownership conflicts.
+            helm upgrade --install shop infra/helm --kube-context $env:CTX -n $env:NS --create-namespace -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --set-string "services.$($env:SVC).image=$img" --force-conflicts --timeout 6m
+            if ($LASTEXITCODE -ne 0) { throw "helm upgrade failed" }
+            kubectl --context $env:CTX -n $env:NS rollout status "deployment/$($env:SVC)" --timeout=180s
+            if ($LASTEXITCODE -ne 0) { throw "rollout failed" }
+
+            # Acceptance suite against the freshly deployed candidate.
+            $ctx = $env:CTX; $ns = $env:NS
+            $pf = Start-Job { kubectl --context $using:ctx -n $using:ns port-forward svc/shop-gateway 8080:8080 }
+            try {
+              $ok = $false
+              foreach ($i in 1..30) {
+                Start-Sleep -Seconds 2
+                try { if ((Invoke-WebRequest "http://localhost:8080/actuator/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { $ok = $true; break } } catch {}
+              }
+              if (-not $ok) { throw "gateway not reachable on localhost:8080" }
+              $env:SHOP_GATEWAY_URL = "http://localhost:8080"
+              Set-Location acceptance
+              .\gradlew.bat test --no-daemon --console=plain
+              if ($LASTEXITCODE -ne 0) { throw "acceptance suite failed" }
+            } finally {
+              Stop-Job $pf -ErrorAction SilentlyContinue
+              Remove-Job $pf -ErrorAction SilentlyContinue
+            }
+          } finally {
+            if ($haveLock) { try { $mutex.ReleaseMutex() } catch {}; Write-Host "Released preprod-gate lock." }
+            $mutex.Dispose()
+          }
+
+      - name: Publish acceptance report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-report-${{ inputs.service }}-pr-${{ github.event.pull_request.number }}
+          path: acceptance/build/reports/tests/test
+          if-no-files-found: ignore
+
+      - name: Cleanup candidate artifacts
+        if: always()
+        run: |
+          Remove-Item -Force image.tar -ErrorAction SilentlyContinue
+          podman rmi "localhost/$($env:SVC):$($env:TAG)" 2>$null
+          exit 0
