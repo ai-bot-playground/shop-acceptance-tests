@@ -28,12 +28,10 @@ concurrency:
 
 jobs:
   gate:
-    # All service gates share ONE org-level self-hosted runner (shop-preprod-1,
-    # label "shop-preprod") on the machine that hosts the kind-preprod cluster.
-    # The deploy step's Global mutex still serializes cluster-touching work; a
-    # single runner additionally runs one job at a time. inputs.service still
-    # selects WHICH service is built/deployed (SVC below), just not the runner.
-    runs-on: [self-hosted, shop-preprod]
+    # Route to the calling repo's OWN runner: each service repo registers a
+    # self-hosted runner labelled with its repo name (= inputs.service). Register
+    # them with shop-infra/register-preprod-runners.ps1.
+    runs-on: [self-hosted, "${{ inputs.service }}"]
     defaults:
       run:
         shell: powershell
