@@ -17,10 +17,6 @@ import java.util.UUID;
  *
  * The create/set/delete calls use non-prod test-support endpoints so each test
  * can provision and tear down its own isolated data.
- *
- * Supports mock login: a randomly generated (or explicitly set) userId is
- * stored as the current user and sent as the {@code X-User-Id} header on every
- * request so that shop-catalog can apply user-specific margins.
  */
 public class ShopClient {
 
@@ -31,41 +27,11 @@ public class ShopClient {
             .connectTimeout(Duration.ofSeconds(5))
             .build();
 
-    private String currentUserId;
-
     public ShopClient() {
         String url = System.getenv("SHOP_GATEWAY_URL");
         this.baseUrl = (url == null || url.isBlank())
                 ? "http://localhost:8080"
                 : url.replaceAll("/+$", "");
-    }
-
-    // ---- mock login / user context ----
-
-    /**
-     * Generates a random mock userId, stores it as the current user, and
-     * returns it. Subsequent requests will carry the {@code X-User-Id} header.
-     */
-    public String login() {
-        this.currentUserId = UUID.randomUUID().toString();
-        return this.currentUserId;
-    }
-
-    /**
-     * Sets an explicit userId as the current user (useful for deterministic
-     * margin verification in scenarios).
-     */
-    public void loginAs(String userId) {
-        this.currentUserId = userId;
-    }
-
-    /** Clears the current user context; no {@code X-User-Id} header is sent. */
-    public void logout() {
-        this.currentUserId = null;
-    }
-
-    public String currentUserId() {
-        return currentUserId;
     }
 
     // ---- test-data provisioning (non-prod) ----
@@ -103,8 +69,6 @@ public class ShopClient {
 
     /**
      * GET /api/products/{productId} -> { ..., "price": <double> }
-     * Returns the price as seen by the current user (margin applied by
-     * shop-catalog when {@code X-User-Id} is set).
      */
     public double productPrice(String productId) {
         return send(get("/api/products/" + productId)).path("price").asDouble();
@@ -132,16 +96,8 @@ public class ShopClient {
 
     // ---- helpers ----
 
-    /**
-     * Base request builder that automatically attaches the {@code X-User-Id}
-     * header when a user is logged in.
-     */
     private HttpRequest.Builder request(URI uri) {
-        HttpRequest.Builder builder = HttpRequest.newBuilder(uri);
-        if (currentUserId != null && !currentUserId.isBlank()) {
-            builder.header("X-User-Id", currentUserId);
-        }
-        return builder;
+        return HttpRequest.newBuilder(uri);
     }
 
     private HttpRequest get(String path) {
