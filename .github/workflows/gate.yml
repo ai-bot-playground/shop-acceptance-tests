@@ -104,32 +104,50 @@ jobs:
             kind load image-archive image.tar --name preprod
             if ($LASTEXITCODE -ne 0) { throw "kind load failed" }
 
-            # One helm operation owns everything (Helm 4 server-side apply): deploys
-            # the baseline stack AND the candidate image via --set-string, so no
-            # `kubectl set image` is needed. --force-conflicts reclaims any fields a
-            # previous run's kubectl grabbed, avoiding SSA ownership conflicts.
-            helm upgrade --install shop infra/helm --kube-context $env:CTX -n $env:NS --create-namespace -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --set-string "services.$($env:SVC).image=$img" --force-conflicts --timeout 6m
-            if ($LASTEXITCODE -ne 0) { throw "helm upgrade failed" }
-            kubectl --context $env:CTX -n $env:NS rollout status "deployment/$($env:SVC)" --timeout=180s
-            if ($LASTEXITCODE -ne 0) { throw "rollout failed" }
-
-            # Acceptance suite against the freshly deployed candidate.
-            $ctx = $env:CTX; $ns = $env:NS
-            $pf = Start-Job { kubectl --context $using:ctx -n $using:ns port-forward svc/shop-gateway 8080:8080 }
+            $deployAttempted = $false
             try {
-              $ok = $false
-              foreach ($i in 1..30) {
-                Start-Sleep -Seconds 2
-                try { if ((Invoke-WebRequest "http://localhost:8080/actuator/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { $ok = $true; break } } catch {}
+              # One helm operation owns everything (Helm 4 server-side apply): deploys
+              # the baseline stack AND the candidate image via --set-string, so no
+              # `kubectl set image` is needed. --force-conflicts reclaims any fields a
+              # previous run's kubectl grabbed, avoiding SSA ownership conflicts.
+              $deployAttempted = $true
+              helm upgrade --install shop infra/helm --kube-context $env:CTX -n $env:NS --create-namespace -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --set-string "services.$($env:SVC).image=$img" --force-conflicts --timeout 6m
+              if ($LASTEXITCODE -ne 0) { throw "helm upgrade failed" }
+              kubectl --context $env:CTX -n $env:NS rollout status "deployment/$($env:SVC)" --timeout=180s
+              if ($LASTEXITCODE -ne 0) { throw "rollout failed" }
+
+              # Acceptance suite against the freshly deployed candidate.
+              $ctx = $env:CTX; $ns = $env:NS
+              $pf = Start-Job { kubectl --context $using:ctx -n $using:ns port-forward svc/shop-gateway 8080:8080 }
+              try {
+                $ok = $false
+                foreach ($i in 1..30) {
+                  Start-Sleep -Seconds 2
+                  try { if ((Invoke-WebRequest "http://localhost:8080/actuator/health" -UseBasicParsing -TimeoutSec 3).StatusCode -eq 200) { $ok = $true; break } } catch {}
+                }
+                if (-not $ok) { throw "gateway not reachable on localhost:8080" }
+                $env:SHOP_GATEWAY_URL = "http://localhost:8080"
+                Push-Location acceptance
+                try {
+                  .\gradlew.bat test --no-daemon --console=plain
+                  if ($LASTEXITCODE -ne 0) { throw "acceptance suite failed" }
+                } finally { Pop-Location }
+              } finally {
+                Stop-Job $pf -ErrorAction SilentlyContinue
+                Remove-Job $pf -ErrorAction SilentlyContinue
               }
-              if (-not $ok) { throw "gateway not reachable on localhost:8080" }
-              $env:SHOP_GATEWAY_URL = "http://localhost:8080"
-              Set-Location acceptance
-              .\gradlew.bat test --no-daemon --console=plain
-              if ($LASTEXITCODE -ne 0) { throw "acceptance suite failed" }
-            } finally {
-              Stop-Job $pf -ErrorAction SilentlyContinue
-              Remove-Job $pf -ErrorAction SilentlyContinue
+            } catch {
+              # A red candidate must not stay on the shared preprod: other repos'
+              # previews would then run against a broken service until the next gate.
+              # Re-apply the chart WITHOUT the candidate override (baseline image),
+              # still under the lock.
+              if ($deployAttempted) {
+                Write-Host "Gate failed - restoring the preprod baseline for $($env:SVC)..."
+                helm upgrade --install shop infra/helm --kube-context $env:CTX -n $env:NS --create-namespace -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --force-conflicts --timeout 6m
+                kubectl --context $env:CTX -n $env:NS rollout status "deployment/$($env:SVC)" --timeout=180s
+                if ($LASTEXITCODE -ne 0) { Write-Warning "baseline restore for $($env:SVC) did not finish - check the cluster" }
+              }
+              throw
             }
           } finally {
             if ($haveLock) { try { $mutex.ReleaseMutex() } catch {}; Write-Host "Released preprod-gate lock." }
