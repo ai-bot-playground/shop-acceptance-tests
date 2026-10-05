@@ -1,0 +1,93 @@
+name: preprod-promote
+
+# Reusable post-merge promotion. Each service repo calls this on `push` to main.
+#
+# Why: helm/values.yaml deploys BASELINE images (localhost/<svc>:0.0.1) and every
+# gate re-applies the chart with them, overriding only its own candidate. Those
+# baseline images used to be built by hand (deploy-kubernetes-preprod.ps1), so a
+# merged change lived on preprod only until the next gate of ANY repo rolled it back
+# to the stale baseline. This job rebuilds the calling service's baseline image from
+# main, loads it into kind-preprod and rolls the deployment, so preprod and every
+# later gate run what is actually on main.
+on:
+  workflow_call:
+    inputs:
+      service:
+        description: Service repo/name being promoted (e.g. shop-order)
+        required: true
+        type: string
+
+# Same group as the gate: a promotion and a gate of the SAME repo never overlap.
+# Cross-repo serialization is the machine-local mutex below (shared with gate.yml).
+concurrency:
+  group: preprod-gate
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    runs-on: [self-hosted, "${{ inputs.service }}"]
+    defaults:
+      run:
+        shell: powershell
+    env:
+      KIND_EXPERIMENTAL_PROVIDER: podman
+      CTX: kind-preprod
+      NS: shop
+      SVC: ${{ inputs.service }}
+      IMG: localhost/${{ inputs.service }}:0.0.1
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          path: candidate
+
+      - name: Checkout Helm chart (shop-infra)
+        uses: actions/checkout@v4
+        with:
+          repository: ai-bot-playground/shop-infra
+          ref: main
+          path: infra
+
+      # The Dockerfiles are multi-stage (gradle / node build inside the image), so
+      # the baseline is built from the merged sources alone.
+      - name: Build baseline image from main
+        run: |
+          podman build -t $env:IMG candidate
+          if ($LASTEXITCODE -ne 0) { throw "podman build failed" }
+
+      - name: Load & roll out baseline (preprod, mutex-guarded)
+        run: |
+          $mutex = New-Object System.Threading.Mutex($false, "Global\shop-preprod-gate")
+          $haveLock = $false
+          try {
+            Write-Host "Waiting for the shared preprod-gate lock..."
+            try { $haveLock = $mutex.WaitOne([TimeSpan]::FromMinutes(60)) } catch [System.Threading.AbandonedMutexException] { $haveLock = $true }
+            if (-not $haveLock) { throw "timed out (60 min) waiting for the preprod-gate lock" }
+            Write-Host "Acquired preprod-gate lock; promoting $($env:IMG)."
+
+            podman save -o image.tar $env:IMG
+            if ($LASTEXITCODE -ne 0) { throw "podman save failed" }
+            kind load image-archive image.tar --name preprod
+            if ($LASTEXITCODE -ne 0) { throw "kind load failed" }
+
+            # Re-apply the chart with baseline images only (drops a lingering
+            # candidate override of this service), then restart: the tag is the
+            # same, the image content is new.
+            helm upgrade --install shop infra/helm --kube-context $env:CTX -n $env:NS --create-namespace -f infra/helm/values.yaml -f infra/helm/values-preprod.yaml --force-conflicts --timeout 6m
+            if ($LASTEXITCODE -ne 0) { throw "helm upgrade failed" }
+            kubectl --context $env:CTX -n $env:NS rollout restart "deployment/$($env:SVC)"
+            if ($LASTEXITCODE -ne 0) { throw "rollout restart failed" }
+            kubectl --context $env:CTX -n $env:NS rollout status "deployment/$($env:SVC)" --timeout=180s
+            if ($LASTEXITCODE -ne 0) { throw "rollout failed" }
+          } finally {
+            if ($haveLock) { try { $mutex.ReleaseMutex() } catch {}; Write-Host "Released preprod-gate lock." }
+            $mutex.Dispose()
+          }
+
+      # The baseline image itself stays in podman: deploy-kubernetes-preprod.ps1
+      # -SkipBuild and later promotions reuse it.
+      - name: Cleanup
+        if: always()
+        run: |
+          Remove-Item -Force image.tar -ErrorAction SilentlyContinue
+          exit 0
