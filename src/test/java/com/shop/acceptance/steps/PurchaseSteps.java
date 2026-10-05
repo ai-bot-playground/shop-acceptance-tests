@@ -22,6 +22,12 @@ public class PurchaseSteps {
         this.ctx = ctx;
     }
 
+    @Given("an existing seeded product with id {string}")
+    public void anExistingSeededProduct(String productId) {
+        assertThat(productId).isIn("1", "2", "3");
+        ctx.productId = productId;
+    }
+
     @Given("a test product priced {double} with {int} unit(s) in stock")
     public void aTestProduct(double price, int units) {
         ctx.productId = ctx.shop.createProduct(price);
@@ -35,6 +41,11 @@ public class PurchaseSteps {
     public void aBuyerOrders(int quantity) {
         ctx.orderId = ctx.shop.createOrder(ctx.productId, quantity);
         assertThat(ctx.orderId).as("created order id").isNotBlank();
+    }
+
+    @Then("the purchase is confirmed")
+    public void thePurchaseIsConfirmed() {
+        theOrderEventuallyBecomes("CONFIRMED");
     }
 
     @Then("the order eventually becomes {string}")
