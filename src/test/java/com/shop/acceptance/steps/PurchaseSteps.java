@@ -17,6 +17,8 @@ public class PurchaseSteps {
     private static final Duration POLL = Duration.ofSeconds(1);
 
     private final TestContext ctx;
+    private Integer availableQuantity;
+    private Integer availabilityResponseStatus;
 
     public PurchaseSteps(TestContext ctx) {
         this.ctx = ctx;
@@ -29,6 +31,27 @@ public class PurchaseSteps {
         ctx.shop.setStock(ctx.productId, units);
         await().atMost(STOCK_TIMEOUT).pollInterval(POLL)
                 .untilAsserted(() -> assertThat(ctx.shop.availableStock(ctx.productId)).isEqualTo(units));
+    }
+
+    @Given("an isolated product with {int} units in stock")
+    public void anIsolatedProductWithUnitsInStock(int units) {
+        aTestProduct(10.00, units);
+    }
+
+    @When("I request the product availability through the gateway")
+    public void iRequestTheProductAvailabilityThroughTheGateway() {
+        availableQuantity = ctx.shop.availableStock(ctx.productId);
+        availabilityResponseStatus = 200;
+    }
+
+    @Then("the availability response status should be {int}")
+    public void theAvailabilityResponseStatusShouldBe(int expected) {
+        assertThat(availabilityResponseStatus).as("availability response status").isEqualTo(expected);
+    }
+
+    @Then("the product available quantity should be {int}")
+    public void theProductAvailableQuantityShouldBe(int expected) {
+        assertThat(availableQuantity).as("available quantity of product %s", ctx.productId).isEqualTo(expected);
     }
 
     @When("a buyer orders {int} unit(s) of the product")
